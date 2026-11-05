@@ -32,6 +32,24 @@ _gen = 0
 _ptzlock = threading.Lock()
 
 
+# image settings re-applied whenever the capture (re)opens — the device
+# resets them on each new stream
+IMG_PREFS = [
+    ["-c", "exposure_dynamic_framerate=0"],
+    ["-c", "auto_exposure=1"],
+    ["-c", "exposure_time_absolute=2047"],
+    ["-c", "gain=190"],
+    ["-c", "backlight_compensation=1"],
+]
+
+def _prefs_later():
+    time.sleep(1.8)
+    apply_img_prefs()
+
+def apply_img_prefs():
+    for args in IMG_PREFS:
+        v4l2(args)
+
 def capture_cmd():
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
            "-f", "v4l2", "-input_format", "yuyv422",
@@ -58,6 +76,10 @@ def capture_loop():
         try:
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                  stderr=subprocess.DEVNULL)
+            apply_img_prefs()
+            # the camera resets image settings again when the stream
+            # actually starts, so re-assert once it has
+            threading.Thread(target=_prefs_later, daemon=True).start()
             print("capture started", flush=True)
             while True:
                 if _cropgen != gen:  # crop changed; reopen with new window
@@ -142,7 +164,7 @@ def luma128x72(jpeg):
     return p.stdout[:128 * 72] if len(p.stdout) >= 128 * 72 else None
 
 
-def blob_centroid(gray, thresh=150, min_px=6):
+def blob_centroid(gray, thresh=140, min_px=6):
     xs, ys, n = 0, 0, 0
     for i, v in enumerate(gray):
         if v > thresh:
@@ -150,7 +172,18 @@ def blob_centroid(gray, thresh=150, min_px=6):
             ys += i // 128
             n += 1
     if n < min_px:
-        return None
+        # dim scenes: re-threshold relative to the brightest pixels present
+        m = max(gray) if gray else 0
+        if m < 40:
+            return None
+        t = max(45, int(m * 3 / 4))
+        for i, v in enumerate(gray):
+            if v > t:
+                xs += i % 128
+                ys += i // 128
+                n += 1
+        if n < 12:
+            return None
     return (xs / n * 10.0, ys / n * 7.5)  # frame coords at 1280x720
 
 
@@ -164,6 +197,10 @@ def set_crop(n):
     if c is None and n > 1:
         return {"error": "no bright blob in view to center on"}
     x, y = c if c else (640, 360)
+    if CROP:  # c is in displayed coords; map back to full frame
+        cw, ch = CROP[0], CROP[1]
+        x = CROP[2] + x / 1280.0 * cw
+        y = CROP[3] + y / 720.0 * ch
     w, h = int(1280 / n), int(720 / n)
     x = max(0, min(1280 - w, int(x - w / 2)))
     y = max(0, min(720 - h, int(y - h / 2)))
@@ -277,6 +314,17 @@ class H(BaseHTTPRequestHandler):
             thr = threading.Thread(target=ptz, args=(op, d, zoom), daemon=True)
             thr.start()  # bounded moves must not tie up the HTTP handler
             self._send(200, b'{"ok":true}', "application/json")
+        elif path == "/focus":
+            def q(name, default):
+                m = re.search(name + r"=(-?[\d.]+)", self.path)
+                return m.group(1) if m else default
+            if q("auto", "0") == "1":
+                v4l2(["-c", "focus_automatic_continuous=1"])
+                self._send(200, b'{"focus":"auto"}', "application/json")
+                return
+            v4l2(["-c", "focus_automatic_continuous=0"])
+            v4l2(["-c", f"focus_absolute={int(float(q('v', 100)))}"])
+            self._send(200, b'{"focus":"manual"}', "application/json")
         elif path == "/crop":
             n = float(re.search(r"c=([\d.]+)", self.path).group(1) or 1)
             self._send(200, json.dumps(set_crop(n)).encode(),
