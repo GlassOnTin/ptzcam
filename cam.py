@@ -124,8 +124,11 @@ def v4l2(args):
 
 
 def v4l2_get(ctrl):
-    out = subprocess.run(["v4l2-ctl", "-d", DEV, f"--get-ctrl={ctrl}"],
-                         capture_output=True, timeout=5).stdout.decode()
+    try:
+        out = subprocess.run(["v4l2-ctl", "-d", DEV, f"--get-ctrl={ctrl}"],
+                             capture_output=True, timeout=5).stdout.decode()
+    except Exception:
+        return None
     m = re.search(r"(?:value|:\s*)(\d+)\s*$", out.strip())
     return int(m.group(1)) if m else None
 
@@ -151,11 +154,56 @@ def ptz(op, d, zoom):
             v4l2(["-c", f"zoom_absolute={max(100, min(1000, zoom))}"])
 
 
+def sharpness(gray):
+    """Focus signal: count strong local gradients (noise and uniform
+    shading contribute nothing)."""
+    if not gray:
+        return 0
+    s = 0
+    for i, v in enumerate(gray):
+        r, c = i // 128, i % 128
+        if c < 127:
+            d = v - gray[i + 1]
+            if d > 24 or d < -24:
+                s += abs(d) - 24
+        if r < 35:
+            d = v - gray[i + 128]
+            if d > 24 or d < -24:
+                s += abs(d) - 24
+    return s
+
+def autofocus():
+    """Software AF: sweep focus, sit on sharpest frame. Assumes the subject
+    of interest is the dominant sharp/high-contrast object (lit display)."""
+    global FOCUS, _cropgen
+    best, best_v = None, -1
+    curve = []
+    for v in (30, 60, 90, 120, 150, 180, 210, 120, 90, 60, 30):
+        v4l2(["-c", "focus_automatic_continuous=0"])
+        v4l2(["-c", f"focus_absolute={v}"])
+        time.sleep(0.65)  # fresh frame at ~3 fps under max exposure
+        with _cond:
+            frame = _latest
+        g = luma128x72(frame) if frame else None
+        sc = sharpness(g)
+        curve.append([v, sc])
+        if sc > best_v:
+            best_v, best = sc, v
+    if best is not None:
+        FOCUS = best
+        v4l2(["-c", "focus_automatic_continuous=0"])
+        v4l2(["-c", f"focus_absolute={best}"])
+    return {"best": best, "sharpness": best_v, "curve": curve}
+
 def op_move(op, d):
     ptz(op, d, 0)
 
 
 # bright-blob locator: downscale via ffmpeg, centroid of lit pixels
+FOCUS = 120       # manual focus, set by slider or AF sweep
+EXPO = 2047       # exposure_time_absolute (manual mode)
+GAIN = 190        # sensor gain
+WB = "auto"       # "auto" or kelvin int
 def luma128x72(jpeg):
     p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error",
                         "-i", "pipe:0", "-vf", "scale=128:72",
@@ -234,7 +282,18 @@ Zoom <input type=range id=zr min=100 max=1000 value=100 oninput="live('z')">
 <div>
 Focus <input type=range id=fr min=0 max=255 value=120 oninput="live('f')">
 <span id=fv></span>
-<button class=b onclick="fetch('/focus?auto=1')">AF</button>
+<button class=b onclick="af()">AF hunt</button>
+</div>
+<div>
+Exposure <input type=range id=er min=100 max=2047 value=2047 oninput="live('e')">
+<span id=ev></span>
+</div>
+<div>
+WB
+<button class=b onclick="wb('auto')">auto</button>
+<button class=b onclick="wb(3000)">3000</button>
+<button class=b onclick="wb(4600)">4600</button>
+<button class=b onclick="wb(5600)">5600</button>
 </div>
 <div>
 Crop:
@@ -258,6 +317,10 @@ function live(which){
     const v = document.getElementById('zr').value;
     document.getElementById('zv').textContent = (v/100).toFixed(1) + 'x';
     fetch('/ptz?op=zoom&zoom=' + v);
+  } else if (which === 'e') {
+    const v = document.getElementById('er').value;
+    document.getElementById('ev').textContent = v;
+    setE(v);
   } else {
     const v = document.getElementById('fr').value;
     document.getElementById('fv').textContent = v;
@@ -269,10 +332,19 @@ fetch('/status').then(r => r.json()).then(j => {
     document.getElementById('zv').textContent = (j.zoom_absolute/100).toFixed(1) + 'x'; }
   if (j.focus_absolute != null) { document.getElementById('fr').value = j.focus_absolute;
     document.getElementById('fv').textContent = j.focus_absolute; }
+  if (j.exposure) { document.getElementById('er').value = j.exposure;
+    document.getElementById('ev').textContent = j.exposure; }
 });
 function crop(n){ fetch('/crop?c=' + n).then(r => r.json()).then(j => {
   document.getElementById('cropinfo').textContent =
     j.error ? j.error : 'crop ' + j.crop.join("x,"); }); }
+async function af(){
+  document.getElementById('cropinfo').textContent = 'focusing...';
+  const j = await (await fetch('/focus?af=1')).json();
+  document.getElementById('cropinfo').textContent = 'AF best ' + j.best;
+}
+function wb(w){ fetch('/img?wb=' + w); }
+function setE(v){ fetch('/img?e=' + v); }
 window.addEventListener('keydown', e => {
   const k = {ArrowLeft:'left',ArrowRight:'right',ArrowUp:'up',ArrowDown:'down'}.get(e.key)
             || (e.key === '+' ? 'zoom_in' : e.key === '-' ? 'zoom_out' : null);
@@ -338,7 +410,30 @@ class H(BaseHTTPRequestHandler):
             thr = threading.Thread(target=ptz, args=(op, d, zoom), daemon=True)
             thr.start()  # bounded moves must not tie up the HTTP handler
             self._send(200, b'{"ok":true}', "application/json")
+        elif path == "/img":
+            def q(name, default):
+                m = re.search(name + r"=([\w]+)", self.path)
+                return m.group(1) if m else default
+            global EXPO, GAIN, WB
+            e = q("e", None)
+            if e is not None:
+                EXPO = max(100, min(2047, int(e)))
+                v4l2(["-c", f"exposure_time_absolute={EXPO}"])
+            g = q("g", None)
+            if g is not None:
+                GAIN = max(0, min(255, int(g)))
+                v4l2(["-c", f"gain={GAIN}"])
+            w = q("wb", None)
+            if w is not None:
+                WB = "auto" if w == "auto" else max(2300, min(7500, int(w)))
+                v4l2(["-f", "wb_auto=1"] if WB == "auto"
+                     else ["-f", f"white_balance_temperature={WB}"])
+            self._send(200, json.dumps({"exposure": EXPO, "gain": GAIN,
+                                        "wb": WB}).encode(), "application/json")
         elif path == "/focus":
+            if re.search(r"af=1", self.path):
+                self._send(200, json.dumps(autofocus()).encode(), "application/json")
+                return
             def q(name, default):
                 m = re.search(name + r"=(-?[\d.]+)", self.path)
                 return m.group(1) if m else default
@@ -354,14 +449,20 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps(set_crop(n)).encode(),
                        "application/json")
         elif path == "/status":
-            self._send(200, json.dumps({
+            try:
+                st = json.dumps({
                 "device": DEV,
                 "zoom_absolute": v4l2_get("zoom_absolute"),
                 "focus_absolute": v4l2_get("focus_absolute"),
                 "focus_auto": v4l2_get("focus_automatic_continuous") == 1,
-                "crop": CROP,
-                "tilt_up_sign": TILT_UP,
-            }).encode(), "application/json")
+                "exposure": EXPO, "gain": GAIN, "wb": WB,
+                    "crop": CROP,
+                    "tilt_up_sign": TILT_UP,
+                })
+                self._send(200, st.encode(), "application/json")
+            except Exception as e:
+                self._send(200, json.dumps({"error": str(e)}).encode(),
+                           "application/json")
         elif path == "/":
             self._send(200, PAGE.encode())
         else:
