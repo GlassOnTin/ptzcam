@@ -248,10 +248,10 @@ def op_move(op, d):
 
 
 # bright-blob locator: downscale via ffmpeg, centroid of lit pixels
-FOCUS = 120       # manual focus, set by slider or AF sweep
-EXPO = 2047       # exposure_time_absolute (manual mode)
+FOCUS = 140       # manual focus (empirical best on the display, 2026-11-05)
+EXPO = 377        # exposure_time_absolute (empirical best on the display; long exposures blur)
 GAIN = 190        # sensor gain
-WB = "auto"       # "auto" or kelvin int
+WB = 5600         # white balance kelvin; "auto" also allowed
 def luma128x72(jpeg):
     p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error",
                         "-i", "pipe:0", "-vf", "scale=128:72",
