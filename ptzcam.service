@@ -1,0 +1,11 @@
+[Unit]
+Description=ptzcam - Logitech Group camera bridge (MJPEG + PTZ)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/ptzcam/cam.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
