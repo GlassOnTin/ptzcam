@@ -15,12 +15,31 @@ dependencies.
 | `/stream` | multipart MJPEG, ~8 fps at 1280×720 |
 | `/frame.jpg` | latest still frame |
 | `/ptz` | `op=left\|right\|up\|down\|stop\|zoom_in\|zoom_out`, `d=<ms>` move duration; `op=zoom&zoom=100..1000` |
+| `/focus` | `v=0..255` manual focus; `af=1`: software autofocus sweep |
+| `/img` | `e=<100..2047>` exposure, `g=<0..255>` gain, `wb=auto\|2300..7500` |
 | `/crop` | `c=1..8`: digital crop-zoom centered on the brightest blob (useful for reading small displays) |
-| `/status` | JSON: device, zoom, crop state |
+| `/status` | JSON: device, zoom, focus, exposure, gain, wb, crop state |
 
 `/ptz` replies immediately and runs the move in the background; movement is
 bounded and self-stops, so a lost request cannot leave the camera in
 motion.
+
+## Software autofocus
+
+`/focus?af=1` (the "AF hunt" button) sweeps focus, scores each stop by
+the variance of the 3×3 Laplacian over the centre region of the frame,
+refines with golden-section inside the bracket, and parks at the peak.
+It assumes the object you focus on is near the frame centre and roughly
+uniformly lit; both the focus curves it knows (Laplacian variance and
+histogram entropy) are returned in the JSON for comparison.
+
+## Image settings
+
+Exposure, gain and white balance live in memory and are **re-applied
+every time the capture stream opens** — most UVC cameras forget their
+image settings whenever a new stream starts, and the bridge re-asserts
+yours instead. The slider values therefore survive crop changes and
+reconnects.
 
 ## Camera requirements
 
