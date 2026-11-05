@@ -206,42 +206,27 @@ def lapvar(gray):
 
 
 def autofocus():
-    """Coarse sweep scoring BOTH metrics; refine on the entropy curve."""
-    stops = [30, 70, 110, 150, 190, 230]
-    ecurve, lcurve = [], []
-    for v in stops:
+    global FOCUS
+    """Software AF, local hybrid: refines around the current focus
+    (operator's slider, or 120 if never set), because the global sharpness
+    landscape is bimodal under mixed focus subjects. Nine stops +-60 in
+    unit-15 steps, median-of-3 lapvar per stop, parks on the argmax."""
+    centre = FOCUS if FOCUS else 120
+    stops = [max(20, centre + k) for k in (-60, -45, -30, -15, 0, 15, 30, 45, 60)]
+    seen = sorted(set(stops))
+    curve = []
+    best, best_v = None, -1
+    for v in seen:
         e, l = score_stop(v)
-        ecurve.append([v, e])
-        lcurve.append([v, l])
-    best_e = max(lcurve, key=lambda x: x[1])  # lapvar is the discriminator
-    i = stops.index(best_e[0])
-    lo = stops[max(0, i - 1)]
-    hi = stops[min(len(stops) - 1, i + 1)]
-    # refine (golden-section) on the laplacian-variance metric
-    gr = (5 ** 0.5 - 1) / 2
-    a, b = lo, hi
-    ce, cl = score_stop(a)
-    de, dl = score_stop(b)
-    for _ in range(5):
-        if b - a < 3:
-            break
-        c = b - gr * (b - a)
-        d = a + gr * (b - a)
-        ec, lc = score_stop(c)
-        ed, ld = score_stop(d)
-        if ec >= ed:
-            b, de, dl = d, ec, lc
-        else:
-            a, ce, cl = c, ed, ld
-    best_v = int((a + b + 1) / 2)
-    fe, fl = score_stop(best_v)
+        curve.append([v, l])
+        if l > best_v:
+            best, best_v = v, l
     v4l2(["-c", "focus_automatic_continuous=0"])
-    v4l2(["-c", f"focus_absolute={best_v}"])
-    FOCUS = best_v
-    return {"best": best_v,
-            "entropy_curve": [[v, round(e, 3)] for v, e in ecurve],
-            "lapvar_curve": [[v, int(l)] for v, l in lcurve],
-            "note": "parked on entropy; compare curve spreads to pick metric"}
+    v4l2(["-c", f"focus_absolute={int(best)}"])
+    FOCUS = int(best)
+    return {"best": int(best), "sharpness": int(best_v),
+            "lapvar_curve": [[v, int(l)] for v, l in curve],
+            "centre": centre}
 
 def op_move(op, d):
     ptz(op, d, 0)
@@ -480,7 +465,11 @@ class H(BaseHTTPRequestHandler):
                                         "wb": WB}).encode(), "application/json")
         elif path == "/focus":
             if re.search(r"af=1", self.path):
-                self._send(200, json.dumps(autofocus()).encode(), "application/json")
+                try:
+                    out = autofocus()
+                except Exception as e:
+                    out = {"error": f"af failed: {e!r}"}
+                self._send(200, json.dumps(out).encode(), "application/json")
                 return
             def q(name, default):
                 m = re.search(name + r"=(-?[\d.]+)", self.path)
