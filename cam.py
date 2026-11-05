@@ -228,10 +228,13 @@ input[type=range]{width:70%}
 <button class=b onclick="go('down')">▼</button>
 </div>
 <div>
-<button class=b onclick="go('zoom_in',800)">Z+</button>
-<button class=b onclick="go('zoom_out',800)">Z−</button>
-<input type=range id=zr min=100 max=1000 value=100
-       onmouseup="go('zoom',0,this.value)">
+Zoom <input type=range id=zr min=100 max=1000 value=100 oninput="live('z')">
+<span id=zv></span>
+</div>
+<div>
+Focus <input type=range id=fr min=0 max=255 value=120 oninput="live('f')">
+<span id=fv></span>
+<button class=b onclick="fetch('/focus?auto=1')">AF</button>
 </div>
 <div>
 Crop:
@@ -243,9 +246,30 @@ Crop:
 </div>
 <p><span id=cropinfo class=s></span></p>
 <script>
-function go(op, d, zoom){
-  fetch('/ptz?op=' + op + (d ? '&d=' + d : '') + (zoom ? '&zoom=' + zoom : ''));
+async function go(op, d, zoom){
+  await fetch('/ptz?op=' + op + (d ? '&d=' + d : '') + (zoom ? '&zoom=' + zoom : ''));
 }
+let lastSet = 0;
+function live(which){
+  const now = Date.now();
+  if (now - lastSet < 120) { clearTimeout(live._t); live._t = setTimeout(() => live(which), 140); return; }
+  lastSet = now;
+  if (which === 'z') {
+    const v = document.getElementById('zr').value;
+    document.getElementById('zv').textContent = (v/100).toFixed(1) + 'x';
+    fetch('/ptz?op=zoom&zoom=' + v);
+  } else {
+    const v = document.getElementById('fr').value;
+    document.getElementById('fv').textContent = v;
+    fetch('/focus?v=' + v);
+  }
+}
+fetch('/status').then(r => r.json()).then(j => {
+  if (j.zoom_absolute) { document.getElementById('zr').value = j.zoom_absolute;
+    document.getElementById('zv').textContent = (j.zoom_absolute/100).toFixed(1) + 'x'; }
+  if (j.focus_absolute != null) { document.getElementById('fr').value = j.focus_absolute;
+    document.getElementById('fv').textContent = j.focus_absolute; }
+});
 function crop(n){ fetch('/crop?c=' + n).then(r => r.json()).then(j => {
   document.getElementById('cropinfo').textContent =
     j.error ? j.error : 'crop ' + j.crop.join("x,"); }); }
@@ -333,6 +357,8 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps({
                 "device": DEV,
                 "zoom_absolute": v4l2_get("zoom_absolute"),
+                "focus_absolute": v4l2_get("focus_absolute"),
+                "focus_auto": v4l2_get("focus_automatic_continuous") == 1,
                 "crop": CROP,
                 "tilt_up_sign": TILT_UP,
             }).encode(), "application/json")
