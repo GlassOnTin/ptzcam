@@ -172,28 +172,72 @@ def sharpness(gray):
                 s += abs(d) - 24
     return s
 
-def autofocus():
-    """Software AF: sweep focus, sit on sharpest frame. Assumes the subject
-    of interest is the dominant sharp/high-contrast object (lit display)."""
-    global FOCUS, _cropgen
-    best, best_v = None, -1
-    curve = []
-    for v in (30, 60, 90, 120, 150, 180, 210, 120, 90, 60, 30):
-        v4l2(["-c", "focus_automatic_continuous=0"])
-        v4l2(["-c", f"focus_absolute={v}"])
-        time.sleep(0.65)  # fresh frame at ~3 fps under max exposure
+def score_focus(v):
+    """Set focus to v, let the stream freshen, return the best-sharpness
+    of two frames (dampens per-frame noise)."""
+    v4l2(["-c", "focus_automatic_continuous=0"])
+    v4l2(["-c", f"focus_absolute={int(v)}"])
+    time.sleep(0.6)
+    samples = []
+    for _ in range(3):
         with _cond:
             frame = _latest
         g = luma128x72(frame) if frame else None
-        sc = sharpness(g)
-        curve.append([v, sc])
-        if sc > best_v:
-            best_v, best = sc, v
-    if best is not None:
-        FOCUS = best
-        v4l2(["-c", "focus_automatic_continuous=0"])
-        v4l2(["-c", f"focus_absolute={best}"])
-    return {"best": best, "sharpness": best_v, "curve": curve}
+        if g:
+            samples.append(sharpness(g))
+        time.sleep(0.25)
+    samples.sort()
+    return samples[len(samples) // 2] if samples else 0
+
+
+def autofocus():
+    """Software AF, two-stage:
+      1. coarse sweep to bracket the peak
+      2. golden-section refinement with an optional parabolic shortcut
+    Purely 1-D optimisation of the sharpness metric."""
+    coarse = [30, 70, 110, 150, 190, 230]
+    scores = {}
+    best, best_v = None, -1
+    for v in coarse:
+        scores[v] = score_focus(v)
+        if scores[v] > best_v:
+            best, best_v = v, scores[v]
+    i = coarse.index(best)
+    lo = coarse[max(0, i - 1)]
+    hi = coarse[min(len(coarse) - 1, i + 1)]
+    if hi - lo <= 6:  # best at a coarse edge; still worth refining
+        lo, hi = max(20, lo - 20), min(240, hi + 20)
+    log = [{"stage": "coarse", "best": best, "score": int(best_v)}]
+
+    # golden-section refinement
+    gr = (5 ** 0.5 - 1) / 2
+    a, b = lo, hi
+    c = b - gr * (b - a)
+    d = a + gr * (b - a)
+    sc = score_focus(c)
+    sd = score_focus(d)
+    for _ in range(6):
+        log.append([int(c), int(sc)], )
+        log.append([int(d), int(sd)])
+        if sc >= sd:
+            b, d, sd = d, c, sc
+            c = b - gr * (b - a)
+            sc = score_focus(c)
+        else:
+            a, c, sc = c, d, sd
+            d = a + gr * (b - a)
+            sd = score_focus(d)
+        if b - a < 2:
+            break
+    best_f = (a + b) / 2
+    best_s = score_focus(best_f)
+    if best_s < best_v:
+        best_f, best_s = best, best_v
+    v4l2(["-c", "focus_automatic_continuous=0"])
+    v4l2(["-c", f"focus_absolute={int(best_f)}"])
+    FOCUS = int(best_f)
+    return {"best": int(best_f), "sharpness": int(best_s),
+            "bracket": [lo, hi], "log": log}
 
 def op_move(op, d):
     ptz(op, d, 0)
