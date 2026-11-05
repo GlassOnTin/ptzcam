@@ -15,7 +15,7 @@ Camera: /dev/video0, any UVC device exposing relative pan/tilt
 Group (046d:0858). Tilt conventions differ between devices/firmware —
 if up/down move the wrong way, swap the two tilt_speed signs in ptz().
 """
-import subprocess, threading, time, re, json
+import subprocess, threading, time, re, json, math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEV = "/dev/video0"
@@ -154,90 +154,94 @@ def ptz(op, d, zoom):
             v4l2(["-c", f"zoom_absolute={max(100, min(1000, zoom))}"])
 
 
-def sharpness(gray):
-    """Focus signal: count strong local gradients (noise and uniform
-    shading contribute nothing)."""
-    if not gray:
-        return 0
-    s = 0
-    for i, v in enumerate(gray):
-        r, c = i // 128, i % 128
-        if c < 127:
-            d = v - gray[i + 1]
-            if d > 24 or d < -24:
-                s += abs(d) - 24
-        if r < 35:
-            d = v - gray[i + 128]
-            if d > 24 or d < -24:
-                s += abs(d) - 24
-    return s
-
-def score_focus(v):
-    """Set focus to v, let the stream freshen, return the best-sharpness
-    of two frames (dampens per-frame noise)."""
+def score_stop(v):
+    """Drive focus to v, settle, return (median entropy, median laplacian
+    variance) over three frames."""
     v4l2(["-c", "focus_automatic_continuous=0"])
     v4l2(["-c", f"focus_absolute={int(v)}"])
     time.sleep(0.6)
-    samples = []
+    ents, laps = [], []
     for _ in range(3):
         with _cond:
             frame = _latest
         g = luma128x72(frame) if frame else None
         if g:
-            samples.append(sharpness(g))
+            ents.append(entropy32(g))
+            laps.append(lapvar(g))
         time.sleep(0.25)
-    samples.sort()
-    return samples[len(samples) // 2] if samples else 0
+    e = sorted(ents)[len(ents) // 2] if ents else 0
+    l = sorted(laps)[len(laps) // 2] if laps else 0
+    return e, l
+
+
+def entropy32(gray):
+    """Shannon entropy of a 32-bin luminance histogram."""
+    hist = [0] * 32
+    for v in gray:
+        hist[v >> 3] += 1
+    n = float(len(gray))
+    h = 0.0
+    for c in hist:
+        if c:
+            p = c / n
+            h -= p * math.log2(p)
+    return h
+
+
+def lapvar(gray):
+    """Variance of the 3x3 Laplacian over the CENTRE REGION of the frame
+    (the subject we AF on sits there; the floor/shelf edges at the frame
+    borders otherwise give a competing peak)."""
+    ls = []
+    for r in range(13, 23):
+        base = r * 128
+        for c in range(32, 96):
+            i = base + c
+            l = 4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - 128] - gray[i + 128]
+            ls.append(l)
+    if not ls:
+        return 0
+    m = sum(ls) / len(ls)
+    return sum((x - m) ** 2 for x in ls) / len(ls)
 
 
 def autofocus():
-    """Software AF, two-stage:
-      1. coarse sweep to bracket the peak
-      2. golden-section refinement with an optional parabolic shortcut
-    Purely 1-D optimisation of the sharpness metric."""
-    coarse = [30, 70, 110, 150, 190, 230]
-    scores = {}
-    best, best_v = None, -1
-    for v in coarse:
-        scores[v] = score_focus(v)
-        if scores[v] > best_v:
-            best, best_v = v, scores[v]
-    i = coarse.index(best)
-    lo = coarse[max(0, i - 1)]
-    hi = coarse[min(len(coarse) - 1, i + 1)]
-    if hi - lo <= 6:  # best at a coarse edge; still worth refining
-        lo, hi = max(20, lo - 20), min(240, hi + 20)
-    log = [{"stage": "coarse", "best": best, "score": int(best_v)}]
-
-    # golden-section refinement
+    """Coarse sweep scoring BOTH metrics; refine on the entropy curve."""
+    stops = [30, 70, 110, 150, 190, 230]
+    ecurve, lcurve = [], []
+    for v in stops:
+        e, l = score_stop(v)
+        ecurve.append([v, e])
+        lcurve.append([v, l])
+    best_e = max(lcurve, key=lambda x: x[1])  # lapvar is the discriminator
+    i = stops.index(best_e[0])
+    lo = stops[max(0, i - 1)]
+    hi = stops[min(len(stops) - 1, i + 1)]
+    # refine (golden-section) on the laplacian-variance metric
     gr = (5 ** 0.5 - 1) / 2
     a, b = lo, hi
-    c = b - gr * (b - a)
-    d = a + gr * (b - a)
-    sc = score_focus(c)
-    sd = score_focus(d)
-    for _ in range(6):
-        log.append([int(c), int(sc)], )
-        log.append([int(d), int(sd)])
-        if sc >= sd:
-            b, d, sd = d, c, sc
-            c = b - gr * (b - a)
-            sc = score_focus(c)
-        else:
-            a, c, sc = c, d, sd
-            d = a + gr * (b - a)
-            sd = score_focus(d)
-        if b - a < 2:
+    ce, cl = score_stop(a)
+    de, dl = score_stop(b)
+    for _ in range(5):
+        if b - a < 3:
             break
-    best_f = (a + b) / 2
-    best_s = score_focus(best_f)
-    if best_s < best_v:
-        best_f, best_s = best, best_v
+        c = b - gr * (b - a)
+        d = a + gr * (b - a)
+        ec, lc = score_stop(c)
+        ed, ld = score_stop(d)
+        if ec >= ed:
+            b, de, dl = d, ec, lc
+        else:
+            a, ce, cl = c, ed, ld
+    best_v = int((a + b + 1) / 2)
+    fe, fl = score_stop(best_v)
     v4l2(["-c", "focus_automatic_continuous=0"])
-    v4l2(["-c", f"focus_absolute={int(best_f)}"])
-    FOCUS = int(best_f)
-    return {"best": int(best_f), "sharpness": int(best_s),
-            "bracket": [lo, hi], "log": log}
+    v4l2(["-c", f"focus_absolute={best_v}"])
+    FOCUS = best_v
+    return {"best": best_v,
+            "entropy_curve": [[v, round(e, 3)] for v, e in ecurve],
+            "lapvar_curve": [[v, int(l)] for v, l in lcurve],
+            "note": "parked on entropy; compare curve spreads to pick metric"}
 
 def op_move(op, d):
     ptz(op, d, 0)
